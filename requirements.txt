@@ -1,0 +1,7 @@
+chromadb
+open-clip-torch
+pillow
+datasets
+langchain-core
+langchain-openai
+python-dotenv
