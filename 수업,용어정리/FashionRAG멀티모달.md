@@ -438,13 +438,28 @@ IMAGE_EXTS = (".jpg", ".jpeg", ".png")                         # 이미지로 �
 # 4. 보조 함수
 # ============================================================
 def list_image_files(folder):
-    """폴더 안의 이미지 파일명을 정렬해서 반환 (zero-padding 덕분에 번호 순서와 같음)"""
+    """폴더 안의 이미지 파일명을 정렬해서 반환 (zero-padding 덕분에 번호 순서와 같음)
+
+    인자:
+        folder (str): 이미지가 들어 있는 폴더 경로. 예) DATASET_FOLDER
+    반환:
+        list[str]: 파일명 목록 (경로 없이 이름만). 예) ["image_0001.jpg", "image_0002.jpg", ...]
+                   폴더가 없으면 []
+    """
     if not os.path.isdir(folder):
         return []
     return sorted(f for f in os.listdir(folder) if f.lower().endswith(IMAGE_EXTS))
 
 def show_image_grid(paths, captions=None, thumb=220):
-    """썸네일을 가로로 이어 붙여 한 장으로 출력 (PIL만 사용)"""
+    """썸네일을 가로로 이어 붙여 한 장으로 출력 (PIL만 사용)
+
+    인자:
+        paths (list[str]): 보여 줄 이미지 파일의 전체 경로 목록
+        captions (list[str] | None): 이미지 아래에 출력할 설명. paths와 같은 순서. 기본값 None (출력 안 함)
+        thumb (int): 썸네일 최대 가로·세로 크기(픽셀). 기본값 220
+    반환:
+        None (노트북에 이미지를 바로 출력)
+    """
     thumbs = []
     for p in paths:
         img = Image.open(p).convert("RGB")
@@ -466,7 +481,13 @@ def show_image_grid(paths, captions=None, thumb=220):
         print(" | ".join(captions))
 
 def guess_mime(path):
-    """확장자로 MIME 타입을 정함 (data URL 만들 때 사용)"""
+    """확장자로 MIME 타입을 정함 (data URL 만들 때 사용)
+
+    인자:
+        path (str): 이미지 파일 경로. 예) ".../image_0001.jpg"
+    반환:
+        str: "image/png" 또는 "image/jpeg"
+    """
     ext = os.path.splitext(path)[1].lower()
     return "image/png" if ext == ".png" else "image/jpeg"
 
@@ -474,12 +495,27 @@ def guess_mime(path):
 # 5. 데이터 준비: Fashionpedia를 스트리밍으로 받아 JPEG로 저장
 # ============================================================
 def setup_dataset():
+    """Fashionpedia를 스트리밍 모드로 열고, 저장할 폴더를 만든다
+
+    인자: 없음
+    반환:
+        IterableDataset: 예시 하나는 dict이고, example["image"] 가 PIL.Image
+    """
     # streaming=True → 전체(약 3.5GB)를 받지 않고 필요한 만큼만 읽음 (IterableDataset)
     dataset = load_dataset("detection-datasets/fashionpedia", split="train", streaming=True)
     os.makedirs(DATASET_FOLDER, exist_ok=True)         # 폴더가 없으면 생성
     return dataset
 
 def save_images(dataset, dataset_folder=DATASET_FOLDER, num_images=NUM_IMAGES):
+    """데이터셋 앞쪽 이미지를 JPEG 파일로 저장
+
+    인자:
+        dataset (IterableDataset): setup_dataset()이 돌려준 데이터셋
+        dataset_folder (str): 저장할 폴더 경로. 기본값 DATASET_FOLDER
+        num_images (int): 저장할 이미지 수. 기본값 NUM_IMAGES (100)
+    반환:
+        None (image_0001.jpg, image_0002.jpg ... 파일이 생김)
+    """
     saved = 0
     for i, example in enumerate(dataset.take(num_images)):            # .take(n): 앞에서 n개만
         file_path = os.path.join(dataset_folder, f"image_{i+1:04d}.jpg")  # 0001처럼 0을 채움
@@ -499,6 +535,14 @@ show_image_grid([os.path.join(DATASET_FOLDER, f) for f in image_files[:3]], capt
 # 6. 벡터 DB: CLIP + Chroma로 이미지 임베딩 저장
 # ============================================================
 def setup_chroma_db(vdb_path=VDB_PATH, collection_name=COLLECTION_NAME):
+    """CLIP 임베딩과 이미지 로더가 연결된 Chroma 컬렉션을 연다 (없으면 만든다)
+
+    인자:
+        vdb_path (str): DB를 저장할 폴더 경로. 기본값 VDB_PATH
+        collection_name (str): 컬렉션 이름. 기본값 "fashion_images"
+    반환:
+        chromadb.Collection: add() / query() / get() / count() 를 쓸 수 있는 컬렉션
+    """
     chroma_client = chromadb.PersistentClient(path=vdb_path)   # 디스크에 저장 (재시작해도 유지)
     return chroma_client.get_or_create_collection(             # 있으면 로드, 없으면 생성
         name=collection_name,
@@ -507,6 +551,15 @@ def setup_chroma_db(vdb_path=VDB_PATH, collection_name=COLLECTION_NAME):
     )
 
 def add_images_to_db(image_vdb, dataset_folder=DATASET_FOLDER, batch_size=50):
+    """폴더의 이미지 중 DB에 아직 없는 것만 임베딩해서 추가 (여러 번 실행해도 안전)
+
+    인자:
+        image_vdb (chromadb.Collection): setup_chroma_db()가 돌려준 컬렉션
+        dataset_folder (str): 이미지 폴더 경로. 기본값 DATASET_FOLDER
+        batch_size (int): 한 번에 add() 할 이미지 수. 기본값 50
+    반환:
+        None (진행 상황만 출력)
+    """
     files = list_image_files(dataset_folder)
     ids  = [os.path.splitext(f)[0] for f in files]             # id = 파일명 (image_0001)
     uris = [os.path.join(dataset_folder, f) for f in files]    # 전체 경로
@@ -532,6 +585,18 @@ add_images_to_db(image_vdb)
 # 7. 검색: 텍스트 → CLIP 텍스트 벡터 → 가까운 이미지  (Retrieval)
 # ============================================================
 def query_db(image_vdb, query, results=N_RESULTS):
+    """텍스트로 비슷한 이미지를 검색
+
+    인자:
+        image_vdb (chromadb.Collection): 검색할 컬렉션
+        query (str): 영어 검색어. 예) "a red dress"
+        results (int): 가져올 이미지 수. 기본값 N_RESULTS (2)
+    반환:
+        dict: 2차원 리스트 구조 ([0] = 첫 번째 검색어의 결과)
+            {"ids": [["image_0042", ...]],
+             "uris": [[".../image_0042.jpg", ...]],
+             "distances": [[0.75, ...]], ...}
+    """
     return image_vdb.query(
         query_texts=[query],                   # 리스트로 넣음 → 결과도 2차원 리스트
         n_results=results,                     # 검색어마다 반환할 개수
@@ -539,6 +604,13 @@ def query_db(image_vdb, query, results=N_RESULTS):
     )
 
 def print_results(results):
+    """검색 결과의 순위·ID·거리를 출력하고 사진을 보여 줌
+
+    인자:
+        results (dict): query_db() 또는 image_vdb.query()의 반환값 ("uris"와 "distances" 포함)
+    반환:
+        None
+    """
     uris = results["uris"][0]                  # [0] = 첫 번째 검색어의 결과
     for rank, uri in enumerate(uris):
         print(f"[{rank+1}위] ID: {results['ids'][0][rank]}  Distance: {results['distances'][0][rank]:.4f}")
@@ -562,12 +634,27 @@ translation_chain = (
 )
 
 def translate(text, target_lang):
+    """텍스트를 원하는 언어로 번역
+
+    인자:
+        text (str): 번역할 문장. 마크다운이 있어도 됨
+        target_lang (str): 목표 언어 이름(영어로). 예) "English", "Korean"
+    반환:
+        str: 번역된 문장
+    """
     return translation_chain.invoke({"text": text, "target_lang": target_lang})
 
 # ============================================================
 # 9. 비전 체인: 텍스트 + 이미지 2장을 함께 LLM에 전달  (Generation)
 # ============================================================
 def setup_vision_chain():
+    """질문 + 이미지 2장을 받아 스타일링 조언을 만드는 체인을 만든다
+
+    인자: 없음
+    반환:
+        Runnable 체인. invoke()에 넣는 dict 형식은 format_prompt_inputs()의 반환값과 같고,
+        결과는 str (영어 답변)
+    """
     image_prompt = ChatPromptTemplate.from_messages([
         ("system",
          "You are a helpful fashion and styling assistant. "
@@ -583,12 +670,27 @@ def setup_vision_chain():
     return image_prompt | ChatOpenAI(model=VISION_MODEL, temperature=0.0) | StrOutputParser()
 
 def encode_image(path):
-    """바이너리 → base64 bytes → str (JSON에 넣을 수 있게)"""
+    """바이너리 → base64 bytes → str (JSON에 넣을 수 있게)
+
+    인자:
+        path (str): 이미지 파일 경로
+    반환:
+        str: base64 문자열. 예) "/9j/4AAQSkZJRg..."
+    """
     with open(path, "rb") as f:                                 # rb = 바이너리 읽기
         return base64.b64encode(f.read()).decode("utf-8")
 
 def format_prompt_inputs(data, user_query):
-    """검색 결과 상위 2장을 비전 프롬프트 입력 dict로 만듦  (Augmentation)"""
+    """검색 결과 상위 2장을 비전 프롬프트 입력 dict로 만듦  (Augmentation)
+
+    인자:
+        data (dict): query_db()의 반환값. data["uris"][0]에 경로가 2개 이상 있어야 함
+        user_query (str): 영어로 번역된 질문
+    반환:
+        dict: {"user_query": str,
+               "image_data_1": str (base64), "image_mime_1": str ("image/jpeg" 등),
+               "image_data_2": str (base64), "image_mime_2": str}
+    """
     uris = data["uris"][0]
     if len(uris) < 2:
         raise ValueError(f"이미지가 최소 2장 필요합니다. 검색 결과 {len(uris)}장")
@@ -604,6 +706,18 @@ vision_chain = setup_vision_chain()
 # 10. 전체 파이프라인: 번역 → 검색 → 프롬프트 구성 → 비전 LLM → 번역
 # ============================================================
 def ask_fashion_rag(query_ko, n_results=N_RESULTS, show=True):
+    """한국어 질문 하나로 번역 → 검색 → 답변 생성 → 번역을 한 번에 실행
+
+    인자:
+        query_ko (str): 한국어 질문. 예) "결혼식 하객룩 원피스 스타일링 알려줘"
+        n_results (int): 검색할 이미지 수 (2 이상). 기본값 N_RESULTS (2)
+        show (bool): True면 검색어·사진·답변을 화면에 출력. 기본값 True
+    반환:
+        dict: {"query_en": str (영어 검색어),
+               "results": dict (query_db() 결과),
+               "response_en": str (영어 답변),
+               "response_ko": str (한국어 답변)}
+    """
     query_en     = translate(query_ko, "English")               # ① 한 → 영 (CLIP이 영어 위주라서)
     results      = query_db(image_vdb, query_en, n_results)     # ② Retrieval: 비슷한 사진 검색
     prompt_input = format_prompt_inputs(results, query_en)      # ③ Augmentation: 이미지를 base64로 프롬프트에 넣음
