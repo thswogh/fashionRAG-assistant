@@ -376,3 +376,261 @@ def filter_by_distance(results, max_distance):
 | Chroma | `embedding_function` 과 `data_loader` 를 연결하면 경로만 넣어도 임베딩과 저장이 자동으로 된다 |
 | LCEL | `prompt \| model \| parser` 로 체인을 만들고 `invoke(dict)` 로 실행한다 |
 | 비전 입력 | `{"type": "image_url", "image_url": {"url": "data:<MIME>;base64,..."}}` |
+
+---
+
+## 전체 코드 한눈에 보기
+
+> 노트북의 셀 [1]~[16]을 실행 순서대로 하나로 합친 코드다. 실습 문제와 출력만 하는 셀은 뺐다.
+
+```python
+# ============================================================
+# 0. 패키지 설치 (처음 한 번만, 설치 후 커널 재시작)
+# ============================================================
+# %pip -q install chromadb open-clip-torch pillow datasets langchain-openai langchain-core python-dotenv
+
+# ============================================================
+# 1. 라이브러리 임포트
+# ============================================================
+import os                         # 경로 조작, 환경변수
+import base64                     # 이미지(바이너리) → base64 문자열
+from getpass import getpass       # API 키를 화면에 보이지 않게 입력받음
+from dotenv import load_dotenv    # .env → os.environ
+
+import chromadb                                                           # 벡터 DB
+from chromadb.utils.embedding_functions import OpenCLIPEmbeddingFunction  # 텍스트/이미지 → CLIP 벡터
+from chromadb.utils.data_loaders import ImageLoader                       # 경로(URI) → 실제 이미지
+
+from datasets import load_dataset                          # Hugging Face 데이터셋
+from langchain_openai import ChatOpenAI                    # OpenAI 채팅 모델
+from langchain_core.prompts import ChatPromptTemplate      # 역할별 프롬프트 템플릿
+from langchain_core.output_parsers import StrOutputParser  # AIMessage → str
+
+from PIL import Image                               # 이미지 열기, 리사이즈, 합치기
+from IPython.display import display, Markdown       # 노트북에 이미지와 마크다운 출력
+
+# ============================================================
+# 2. API 키 설정: .env → 없으면 직접 입력 → 그래도 없으면 에러
+# ============================================================
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    OPENAI_API_KEY = getpass("OpenAI API 키를 입력하세요 (sk-...): ").strip()
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY 가 설정되지 않았습니다.")
+os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY      # ChatOpenAI가 자동으로 읽음
+print("API 키 설정 완료:", OPENAI_API_KEY[:6] + "...")   # 보안 때문에 앞 6자리만 출력
+
+# ============================================================
+# 3. 설정값을 한 곳에 모음 (여기만 고치면 전체 동작이 바뀜)
+# ============================================================
+BASE_DIR        = os.getcwd()                                  # 노트북에는 __file__이 없음
+DATASET_FOLDER  = os.path.join(BASE_DIR, "fashion_dataset")    # 이미지 저장 폴더
+VDB_PATH        = os.path.join(BASE_DIR, "img_vdb")            # Chroma DB 저장 폴더
+COLLECTION_NAME = "fashion_images"                             # 컬렉션(테이블) 이름
+NUM_IMAGES = 100                                               # 가져올 이미지 수
+N_RESULTS  = 2                                                 # 질문당 검색할 이미지 수
+TRANSLATION_MODEL = "gpt-4o-mini"                              # 번역용 모델
+VISION_MODEL      = "gpt-4o-mini"                              # 이미지를 이해하는 비전 모델
+IMAGE_EXTS = (".jpg", ".jpeg", ".png")                         # 이미지로 인정할 확장자
+
+# ============================================================
+# 4. 보조 함수
+# ============================================================
+def list_image_files(folder):
+    """폴더 안의 이미지 파일명을 정렬해서 반환 (zero-padding 덕분에 번호 순서와 같음)"""
+    if not os.path.isdir(folder):
+        return []
+    return sorted(f for f in os.listdir(folder) if f.lower().endswith(IMAGE_EXTS))
+
+def show_image_grid(paths, captions=None, thumb=220):
+    """썸네일을 가로로 이어 붙여 한 장으로 출력 (PIL만 사용)"""
+    thumbs = []
+    for p in paths:
+        img = Image.open(p).convert("RGB")
+        img.thumbnail((thumb, thumb))                  # 비율을 유지하며 축소
+        thumbs.append(img)
+    if not thumbs:
+        print("(표시할 이미지가 없습니다.)")
+        return
+    gap = 10
+    width  = sum(t.width for t in thumbs) + gap * (len(thumbs) - 1)  # 너비 합 + 여백
+    height = max(t.height for t in thumbs)                           # 가장 큰 높이
+    canvas = Image.new("RGB", (width, height), "white")              # 흰 배경 캔버스
+    x = 0
+    for t in thumbs:
+        canvas.paste(t, (x, 0))                        # 왼쪽부터 붙임
+        x += t.width + gap
+    display(canvas)
+    if captions:
+        print(" | ".join(captions))
+
+def guess_mime(path):
+    """확장자로 MIME 타입을 정함 (data URL 만들 때 사용)"""
+    ext = os.path.splitext(path)[1].lower()
+    return "image/png" if ext == ".png" else "image/jpeg"
+
+# ============================================================
+# 5. 데이터 준비: Fashionpedia를 스트리밍으로 받아 JPEG로 저장
+# ============================================================
+def setup_dataset():
+    # streaming=True → 전체(약 3.5GB)를 받지 않고 필요한 만큼만 읽음 (IterableDataset)
+    dataset = load_dataset("detection-datasets/fashionpedia", split="train", streaming=True)
+    os.makedirs(DATASET_FOLDER, exist_ok=True)         # 폴더가 없으면 생성
+    return dataset
+
+def save_images(dataset, dataset_folder=DATASET_FOLDER, num_images=NUM_IMAGES):
+    saved = 0
+    for i, example in enumerate(dataset.take(num_images)):            # .take(n): 앞에서 n개만
+        file_path = os.path.join(dataset_folder, f"image_{i+1:04d}.jpg")  # 0001처럼 0을 채움
+        example["image"].convert("RGB").save(file_path, format="JPEG", quality=90)  # JPEG로 용량 절약
+        saved += 1
+    print(f"{saved}장 저장 완료")
+
+# 이미 충분히 저장돼 있으면 다운로드를 건너뜀
+if len(list_image_files(DATASET_FOLDER)) < NUM_IMAGES:
+    save_images(setup_dataset())
+image_files = list_image_files(DATASET_FOLDER)
+
+# 앞의 3장을 눈으로 확인
+show_image_grid([os.path.join(DATASET_FOLDER, f) for f in image_files[:3]], captions=image_files[:3])
+
+# ============================================================
+# 6. 벡터 DB: CLIP + Chroma로 이미지 임베딩 저장
+# ============================================================
+def setup_chroma_db(vdb_path=VDB_PATH, collection_name=COLLECTION_NAME):
+    chroma_client = chromadb.PersistentClient(path=vdb_path)   # 디스크에 저장 (재시작해도 유지)
+    return chroma_client.get_or_create_collection(             # 있으면 로드, 없으면 생성
+        name=collection_name,
+        embedding_function=OpenCLIPEmbeddingFunction(),        # add/query 때 자동으로 CLIP 벡터 계산
+        data_loader=ImageLoader(),                             # uris를 실제 이미지로 읽음
+    )
+
+def add_images_to_db(image_vdb, dataset_folder=DATASET_FOLDER, batch_size=50):
+    files = list_image_files(dataset_folder)
+    ids  = [os.path.splitext(f)[0] for f in files]             # id = 파일명 (image_0001)
+    uris = [os.path.join(dataset_folder, f) for f in files]    # 전체 경로
+
+    existing_ids = set(image_vdb.get(include=[])["ids"])       # 이미 등록된 id만 가볍게 조회
+    new_items = [(i, u) for i, u in zip(ids, uris) if i not in existing_ids]   # 없는 것만 (멱등성)
+    if not new_items:
+        print(f"추가할 새 이미지가 없습니다. (현재 {image_vdb.count()}장)")
+        return
+
+    for start in range(0, len(new_items), batch_size):        # 50장씩 나눠서 추가
+        batch = new_items[start:start + batch_size]
+        image_vdb.add(
+            ids=[i for i, _ in batch],
+            uris=[u for _, u in batch],        # 경로 → ImageLoader → CLIP 이미지 인코더 → 저장
+        )
+    print(f"벡터 DB 등록 완료 (총 {image_vdb.count()}장)")
+
+image_vdb = setup_chroma_db()
+add_images_to_db(image_vdb)
+
+# ============================================================
+# 7. 검색: 텍스트 → CLIP 텍스트 벡터 → 가까운 이미지  (Retrieval)
+# ============================================================
+def query_db(image_vdb, query, results=N_RESULTS):
+    return image_vdb.query(
+        query_texts=[query],                   # 리스트로 넣음 → 결과도 2차원 리스트
+        n_results=results,                     # 검색어마다 반환할 개수
+        include=["uris", "distances"],         # 경로와 거리 (ids는 항상 포함)
+    )
+
+def print_results(results):
+    uris = results["uris"][0]                  # [0] = 첫 번째 검색어의 결과
+    for rank, uri in enumerate(uris):
+        print(f"[{rank+1}위] ID: {results['ids'][0][rank]}  Distance: {results['distances'][0][rank]:.4f}")
+    show_image_grid(uris, [f"{r+1}위 {results['ids'][0][r]}" for r in range(len(uris))])
+
+print_results(query_db(image_vdb, "orange one", results=3))   # OpenAI 없이 CLIP + Chroma만으로 검색 테스트
+
+# ============================================================
+# 8. 번역 체인 (LCEL: 프롬프트 | 모델 | 파서)
+# ============================================================
+translation_prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a professional translator. "
+               "Translate the following text to {target_lang}. "
+               "Keep markdown formatting. Output only the translation."),
+    ("user", "{text}"),                        # {변수}는 invoke 때 dict로 채움
+])
+translation_chain = (
+    translation_prompt                                          # dict → 메시지 목록
+    | ChatOpenAI(model=TRANSLATION_MODEL, temperature=0.0)      # 메시지 → AIMessage (번역은 temperature 0)
+    | StrOutputParser()                                         # AIMessage → str
+)
+
+def translate(text, target_lang):
+    return translation_chain.invoke({"text": text, "target_lang": target_lang})
+
+# ============================================================
+# 9. 비전 체인: 텍스트 + 이미지 2장을 함께 LLM에 전달  (Generation)
+# ============================================================
+def setup_vision_chain():
+    image_prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "You are a helpful fashion and styling assistant. "
+         "Answer the user's question using the given image context with direct references "
+         "to parts of the images provided. Maintain a more conversational tone, "
+         "don't make too many lists. Use markdown formatting for highlights, emphasis, and structure."),
+        ("user", [                                              # user 메시지를 콘텐츠 블록 리스트로 보냄
+            {"type": "text", "text": "What are some ideas for styling {user_query}"},
+            {"type": "image_url", "image_url": {"url": "data:{image_mime_1};base64,{image_data_1}"}},
+            {"type": "image_url", "image_url": {"url": "data:{image_mime_2};base64,{image_data_2}"}},
+        ]),
+    ])
+    return image_prompt | ChatOpenAI(model=VISION_MODEL, temperature=0.0) | StrOutputParser()
+
+def encode_image(path):
+    """바이너리 → base64 bytes → str (JSON에 넣을 수 있게)"""
+    with open(path, "rb") as f:                                 # rb = 바이너리 읽기
+        return base64.b64encode(f.read()).decode("utf-8")
+
+def format_prompt_inputs(data, user_query):
+    """검색 결과 상위 2장을 비전 프롬프트 입력 dict로 만듦  (Augmentation)"""
+    uris = data["uris"][0]
+    if len(uris) < 2:
+        raise ValueError(f"이미지가 최소 2장 필요합니다. 검색 결과 {len(uris)}장")
+    inputs = {"user_query": user_query}
+    for n, path in enumerate(uris[:2], start=1):
+        inputs[f"image_data_{n}"] = encode_image(path)          # base64 문자열
+        inputs[f"image_mime_{n}"] = guess_mime(path)            # 실제 파일 형식에 맞는 MIME
+    return inputs
+
+vision_chain = setup_vision_chain()
+
+# ============================================================
+# 10. 전체 파이프라인: 번역 → 검색 → 프롬프트 구성 → 비전 LLM → 번역
+# ============================================================
+def ask_fashion_rag(query_ko, n_results=N_RESULTS, show=True):
+    query_en     = translate(query_ko, "English")               # ① 한 → 영 (CLIP이 영어 위주라서)
+    results      = query_db(image_vdb, query_en, n_results)     # ② Retrieval: 비슷한 사진 검색
+    prompt_input = format_prompt_inputs(results, query_en)      # ③ Augmentation: 이미지를 base64로 프롬프트에 넣음
+    response_en  = vision_chain.invoke(prompt_input)            # ④ Generation: 사진을 보고 조언 생성
+    response_ko  = translate(response_en, "Korean")             # ⑤ 영 → 한
+    if show:
+        print("번역된 검색어:", query_en)
+        print_results(results)
+        display(Markdown(response_ko))                          # 마크다운으로 렌더링
+    return {"query_en": query_en, "results": results,
+            "response_en": response_en, "response_ko": response_ko}
+
+answer = ask_fashion_rag("결혼식 하객룩으로 어울리는 원피스 스타일링 알려줘")
+
+# ============================================================
+# 11. (선택) 대화형 모드: 기본값은 꺼 둠 ("전체 실행" 때 input()에서 멈추지 않게)
+# ============================================================
+RUN_INTERACTIVE = False
+if RUN_INTERACTIVE:
+    while True:
+        query_ko = input("\n스타일 질문을 입력하세요 (종료: quit): ").strip()
+        if query_ko.lower() in ("quit", "exit", "q", "종료"):
+            break
+        if not query_ko:                       # 빈 입력은 무시
+            continue
+        try:
+            ask_fashion_rag(query_ko)
+        except Exception as e:                 # API 오류가 나도 루프가 멈추지 않게
+            print("오류가 발생했습니다:", e)
+```
